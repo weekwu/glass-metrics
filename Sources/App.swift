@@ -44,8 +44,10 @@ import ServiceManagement
     private var quotaTimer: Timer?
     private let network = NetworkSampler()
     private let temperatureReader = TemperatureSampler()
-    private let quotaReader = QuotaSampler()
+    private var quotaReader: QuotaSampler?
+    private var quotaRequestID = 0
     private var loginReader: QuotaSampler?
+    private var loginRequestID = 0
     private var temperatureRunning = false
     private var consecutiveFailures = 0
 
@@ -63,8 +65,33 @@ import ServiceManagement
         networkTimer?.invalidate()
         temperatureTimer?.invalidate()
         quotaTimer?.invalidate()
-        quotaReader.stop()
+        quotaRequestID += 1
+        quotaReader?.stop()
+        quotaReader = nil
         loginReader?.stop()
+    }
+
+    func prepareForSleep() {
+        quotaTimer?.invalidate()
+        quotaRequestID += 1
+        quotaReader?.stop()
+        quotaReader = nil
+        quotaRunning = false
+        if loginInProgress {
+            loginRequestID += 1
+            loginReader?.stop()
+            loginReader = nil
+            loginInProgress = false
+            loginStatus = "睡眠中断了登录，请唤醒后重新登录。"
+        }
+    }
+
+    func resumeAfterSleep() {
+        startNetwork() // Reset the byte-counter baseline so sleep time is not counted as network traffic.
+        startTemperature()
+        readTemperature()
+        consecutiveFailures = 0
+        refreshQuota()
     }
 
     private func startTemperature() {
@@ -120,13 +147,18 @@ import ServiceManagement
         quotaTimer?.invalidate()
         nextQuotaAttempt = nil
         quotaRunning = true
-        let reader = quotaReader
+        quotaRequestID += 1
+        let requestID = quotaRequestID
+        let reader = QuotaSampler()
+        quotaReader = reader
         let options = codexOptions
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let value = reader.sample(options: options)
             DispatchQueue.main.async {
-                self?.quotaRunning = false
-                self?.acceptQuota(value)
+                guard let self, self.quotaRequestID == requestID else { return }
+                self.quotaReader = nil
+                self.quotaRunning = false
+                self.acceptQuota(value)
             }
         }
     }
@@ -136,7 +168,7 @@ import ServiceManagement
         if let issue = value.issue {
             if !issue.canKeepPreviousData { lastQuotaUpdate = nil }
             consecutiveFailures += 1
-            let delay = issue.isTransient ? min(600, 30 * pow(2, Double(min(consecutiveFailures - 1, 5))))
+            let delay = issue.isTransient ? min(300, 15 * pow(2, Double(min(consecutiveFailures - 1, 5))))
                                           : max(600, Double(codexInterval))
             scheduleQuota(after: delay)
         } else {
@@ -155,6 +187,8 @@ import ServiceManagement
 
     func loginCodex() {
         guard !loginInProgress, !quotaRunning else { return }
+        loginRequestID += 1
+        let requestID = loginRequestID
         quotaTimer?.invalidate(); nextQuotaAttempt = nil
         loginInProgress = true
         loginStatus = "正在打开官方登录页…"
@@ -165,13 +199,13 @@ import ServiceManagement
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let value = reader.sample(options: options, onLoginURL: { [weak self] url in
                 DispatchQueue.main.async {
-                    guard self?.loginInProgress == true else { return }
-                    if NSWorkspace.shared.open(url) { self?.loginStatus = "请在浏览器完成 ChatGPT 登录。" }
-                    else { self?.loginStatus = "浏览器无法打开，可在终端运行 codex login。"; reader.stop() }
+                    guard let self, self.loginRequestID == requestID, self.loginInProgress else { return }
+                    if NSWorkspace.shared.open(url) { self.loginStatus = "请在浏览器完成 ChatGPT 登录。" }
+                    else { self.loginStatus = "浏览器无法打开，可在终端运行 codex login。"; reader.stop() }
                 }
             })
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.loginRequestID == requestID else { return }
                 self.loginReader = nil
                 self.loginInProgress = false
                 self.loginStatus = value.issue == nil ? "登录成功，限额已更新。" : value.issue?.title
@@ -180,7 +214,13 @@ import ServiceManagement
         }
     }
 
-    func cancelLogin() { loginReader?.stop() }
+    func cancelLogin() {
+        loginRequestID += 1
+        loginReader?.stop()
+        loginReader = nil
+        loginInProgress = false
+        loginStatus = "登录已取消。"
+    }
 
     func chooseCodex() {
         let chooser = NSOpenPanel()
@@ -396,6 +436,8 @@ final class CardHostingView: NSHostingView<MetricCard> {
     private let state = MonitorState()
     private var panel: NSPanel!
     private var settings: NSWindow?
+    private var sleepObserver: NSObjectProtocol?
+    private var wakeObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -431,6 +473,15 @@ final class CardHostingView: NSHostingView<MetricCard> {
         menu.addItem(NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q"))
         menu.items.forEach { $0.target = self }
         host.cardMenu = menu
+        let workspaceNotifications = NSWorkspace.shared.notificationCenter
+        sleepObserver = workspaceNotifications.addObserver(forName: NSWorkspace.willSleepNotification,
+                                                           object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.state.prepareForSleep() }
+        }
+        wakeObserver = workspaceNotifications.addObserver(forName: NSWorkspace.didWakeNotification,
+                                                           object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.state.resumeAfterSleep() }
+        }
         state.start()
     }
 
@@ -451,7 +502,12 @@ final class CardHostingView: NSHostingView<MetricCard> {
         showSettings()
         return true
     }
-    func applicationWillTerminate(_ notification: Notification) { state.stop() }
+    func applicationWillTerminate(_ notification: Notification) {
+        state.stop()
+        let workspaceNotifications = NSWorkspace.shared.notificationCenter
+        if let sleepObserver { workspaceNotifications.removeObserver(sleepObserver) }
+        if let wakeObserver { workspaceNotifications.removeObserver(wakeObserver) }
+    }
     @objc private func showSettings() {
         if settings == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 470, height: 510),

@@ -18,7 +18,7 @@
 - **Codex**：显示 5 小时及每周**剩余额度比例**与距重置的大致时间。这不是剩余 token 数，也不是 API 余额。
 - **桌面卡片**：约 360 × 214 pt；可拖动、记住位置、调节背景厚度、选择桌面层或始终置顶。
 - **独立刷新**：调整一个模块不会提高其他模块的采样频率。
-- **故障恢复**：错误分类、手动刷新、自动退避重试、官方浏览器登录、可选系统 HTTP 代理。
+- **故障恢复**：限额查询短重试、空响应复查、旧数据标记、自动退避重试、官方浏览器登录、可选系统 HTTP 代理。
 
 | 模块 | 默认刷新 | 可选间隔 |
 | --- | --- | --- |
@@ -48,6 +48,8 @@ open ./GlassMetrics.app
 
 构建仅使用系统开发工具，不拉取第三方包。生成的 `GlassMetrics.app` 位于仓库根目录；缓存和中间文件在临时目录中自动清理。应用使用本地 ad-hoc 签名，尚未作为 Developer ID 签名、公证的正式发行包发布。需要跨设备分发时，应另行完成签名与公证。
 
+发布版本使用 Git 标签。当前稳定版为 `v0.4.1`；需要回到上一版时，运行 `git fetch --tags origin`、`git switch --detach v0.4.0`、`./build.sh`，再重新打开生成的应用。回到最新版可运行 `git switch main` 并重新构建。
+
 长期使用可将应用复制到 `/Applications` 或 `~/Applications`，再在设置中开启“登录时启动”。以后移动应用位置，需要重新设置登录项。源码构建不自动安装或开启登录项。
 
 ### 基本操作
@@ -70,7 +72,7 @@ codex --version
 codex login status
 ```
 
-Glass Metrics 会搜索常见 CLI 安装位置，包括 `~/.local/bin`、Homebrew 路径、`~/.cargo/bin`、进程 `PATH`，以及部分官方桌面应用中的内置 CLI（仅在对应文件存在时使用）。
+Glass Metrics 会搜索常见 CLI 安装位置，包括 `~/.local/bin`、Homebrew 路径、`~/.cargo/bin`、进程 `PATH`，以及 ChatGPT 桌面应用中随版本变化的内置 CLI 位置。ChatGPT 更新改变 CLI 所在目录时，应用会从已注册的 ChatGPT 应用包中重新发现可执行文件。
 
 如果自动发现失败，打开 **设置 → Codex → 选择 Codex…**，选择真实的 `codex` 可执行文件。用 nvm 等工具安装的 CLI，尤其可能需要手动选择。选择的文件必须能正常运行 `codex app-server --listen stdio://`。
 
@@ -106,14 +108,14 @@ API Key、第三方 API 提供商、Bedrock 等登录方式不等同于 ChatGPT 
 | 未找到 Codex | 安装官方 CLI，或在设置里选择可执行文件。 |
 | Codex 启动失败 | 在终端检查 `codex --version`；确认 CLI 配置能正常加载，必要时更新或重新选择文件。 |
 | 需要重新登录 | 点“登录 Codex”，或运行 `codex login`。认证过期时会先尝试一次官方 token 刷新。 |
-| 网络连接失败 / 查询超时 | 检查网络及代理，点“立即刷新”；程序也会自动重试。 |
+| 网络连接失败 / 查询超时 | CLI 的限额请求没有完成。应用会在同一连接中短重试；若持续失败，检查代理程序和网络，再点“立即刷新”。 |
 | 查询暂时被限流 | 稍后重试或延长间隔。查询被限流不代表订阅额度已用完。 |
 | 服务暂时不可用 | 等待自动重试，或查看 [OpenAI 服务状态](https://status.openai.com/)。 |
 | 访问被拒绝 | 检查账户访问权限、网络和代理；持续失败再尝试重新登录。 |
 | 需要更新 Codex / 响应格式异常 | 更新官方 CLI，确认使用的可执行文件正确。 |
 | 暂无订阅限额 | 当前登录方式、账户或服务响应没有提供所需窗口。 |
 
-临时错误按约 30、60、120 秒逐步延长重试，最长约 10 分钟。缺少 CLI、需要登录等错误会降低自动尝试频率，可随时手动刷新。设置中显示上次成功时间、下次尝试时间和安全的错误代码。
+正常查询直接读取限额，减少一次账户请求。网络或服务偶发错误会在同一 App Server 进程内最多短重试两次；首次空限额响应会复查一次。仍失败时按约 15、30、60 秒逐步延长自动尝试，最长约 5 分钟。缺少 CLI、需要登录等错误会降低自动尝试频率，可随时手动刷新。设置中显示上次成功时间、下次尝试时间和安全的错误代码。
 
 **暂时查不到时不会把额度变成零。** 同一次运行中会保留上次成功数据，降低进度条透明度并标明“旧数据”；旧数据不表示实时余额。登录失效或主动重新登录时会清空旧账户数据。退出应用后不保存限额缓存。
 
@@ -141,7 +143,7 @@ API Key、第三方 API 提供商、Bedrock 等登录方式不等同于 ChatGPT 
 
 离线测试使用系统开发工具附带的 Python 3 模拟 App Server，不需要真实账户；测试会自动清理临时进程和文件。`--live` 需要正常本机权限、网络以及已经登录的 CLI。浏览器登录使用模拟协议回调测试，不会在测试中替换真实账户。
 
-测试覆盖：分片响应、初始化顺序、大量 stderr、超时、取消、子进程回收、认证刷新、登录回调匹配、登录 URL 校验、错误脱敏、旧数据保留及账户数据清理。
+测试覆盖：分片响应、初始化顺序、大量 stderr、临时 RPC 错误重试、空限额复查、超时、取消、子进程回收、认证刷新、登录回调匹配、登录 URL 校验、错误脱敏、旧数据保留及账户数据清理。
 
 ```text
 Sources/App.swift          窗口、设置、独立定时器与恢复策略
@@ -161,7 +163,7 @@ Tests/                    离线及真实环境检查
 这个项目受益于以下开源项目和公开资料：
 
 - **[exelban/stats](https://github.com/exelban/stats)**：主要温度实现参考，包含 Apple Silicon CPU 传感器命名、SMC 键和 HID 采样思路。感谢 Serhiy Mytrovtsiy 及贡献者长期维护这些硬件知识。改编部分保留 MIT 许可说明。
-- **[Javis603/token-monitor](https://github.com/Javis603/token-monitor)**：Codex 限额监控及统一小组件的产品和实现思路参考。本项目独立实现原生 App Server 客户端，未引入其 Electron 界面或运行时。
+- **[Javis603/token-monitor](https://github.com/Javis603/token-monitor)**：Codex 限额监控及统一小组件的产品和实现思路参考；其限额收集器的直接查询、空响应复查、保留上次成功结果及退避重试策略也启发了本版稳定性改进。本项目独立实现原生 App Server 客户端，未引入其 Electron 界面或运行时。
 - **[fermion-star/apple_sensors](https://github.com/fermion-star/apple_sensors)** 及其注明的上游 **[freedomtan/sensors](https://github.com/freedomtan/sensors)**：Apple Silicon HID 温度事件 API 声明及采样方式参考；保留原作者 “freedom” Koan-Sin Tan 的 BSD 3-Clause 说明。
 - **[beltex/SMCKit](https://github.com/beltex/SMCKit)**：SMC 接口与数据读取方面的参考阅读，没有作为运行时依赖打包。
 - **[openai/codex](https://github.com/openai/codex)** 与 [官方 App Server 文档](https://learn.chatgpt.com/docs/app-server)：提供账户、限额和浏览器登录协议。

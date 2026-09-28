@@ -5,6 +5,7 @@ import Darwin
     static func check(_ condition: @autoclosure () -> Bool, _ message: String) {
         guard condition() else { fatalError(message) }
         print("PASS: \(message)")
+        fflush(stdout)
     }
 
     static func main() throws {
@@ -36,8 +37,6 @@ import Darwin
         sys.stderr.write('x' * 200000); sys.stderr.flush()
         print(json.dumps({'id':1,'result':{}}), flush=True)
         assert json.loads(sys.stdin.readline())['method'] == 'initialized'
-        assert json.loads(sys.stdin.readline())['method'] == 'account/read'
-        print(json.dumps({'id':2,'result':{'account':{'type':'chatgpt'}}}), flush=True)
         assert json.loads(sys.stdin.readline())['method'] == 'account/rateLimits/read'
         payload = '\(response)' + '\\n'
         print(json.dumps({'method':'notification','params':{}}), flush=True)
@@ -46,7 +45,35 @@ import Darwin
         sys.stdin.read()
         """)
         let streamed = QuotaSampler().sample(executableURL: success, timeout: 3)
-        check(streamed == parsed, "Handshake, fragmented stdout and large stderr complete without deadlock")
+        check(streamed == parsed, "Direct quota request, fragmented stdout and large stderr complete without deadlock")
+
+        let handshake = """
+        assert json.loads(sys.stdin.readline())['method'] == 'initialize'
+        print(json.dumps({'id':1,'result':{}}), flush=True)
+        assert json.loads(sys.stdin.readline())['method'] == 'initialized'
+
+        """
+        let transientThenSuccess = try fixture("transient_retry", handshake + """
+        assert json.loads(sys.stdin.readline())['method'] == 'account/rateLimits/read'
+        print(json.dumps({'id':3,'error':{'code':-32603,'message':'error sending request'}}),flush=True)
+        retry=json.loads(sys.stdin.readline())
+        assert retry['method']=='account/rateLimits/read' and retry['id']==3
+        print('\(response)',flush=True)
+        sys.stdin.read()
+        """)
+        check(QuotaSampler().sample(executableURL: transientThenSuccess, timeout: 4) == parsed,
+              "Transient quota RPC error retries within the same app-server session")
+
+        let emptyThenSuccess = try fixture("empty_retry", handshake + """
+        assert json.loads(sys.stdin.readline())['method'] == 'account/rateLimits/read'
+        print(json.dumps({'id':3,'result':{}}),flush=True)
+        retry=json.loads(sys.stdin.readline())
+        assert retry['method']=='account/rateLimits/read' and retry['id']==3
+        print('\(response)',flush=True)
+        sys.stdin.read()
+        """)
+        check(QuotaSampler().sample(executableURL: emptyThenSuccess, timeout: 3) == parsed,
+              "A temporarily empty quota response is retried once")
 
         let silent = try fixture("silent", """
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -84,15 +111,7 @@ import Darwin
         check(!QuotaSampler.isTrustedLoginURL(URL(string: "https://auth.openai.com.evil.test/authorize")!), "Reject lookalike login hosts")
         check(!QuotaSampler.isTrustedLoginURL(URL(string: "http://auth.openai.com/authorize")!), "Reject insecure login URL")
 
-        let handshake = """
-        assert json.loads(sys.stdin.readline())['method'] == 'initialize'
-        print(json.dumps({'id':1,'result':{}}), flush=True)
-        assert json.loads(sys.stdin.readline())['method'] == 'initialized'
-
-        """
         let authPrefix = handshake + """
-        assert json.loads(sys.stdin.readline())['method'] == 'account/read'
-        print(json.dumps({'id':2,'result':{'account':{'type':'chatgpt'}}}), flush=True)
         assert json.loads(sys.stdin.readline())['method'] == 'account/rateLimits/read'
 
         """
@@ -109,8 +128,11 @@ import Darwin
         check(QuotaSampler().sample(executableURL: refresh, timeout: 3) == parsed, "Refresh expired authentication once, then retry quota")
 
         let absent = try fixture("not_logged_in", handshake + """
-        assert json.loads(sys.stdin.readline())['method']=='account/read'
-        print(json.dumps({'id':2,'result':{'account':None}}),flush=True)
+        assert json.loads(sys.stdin.readline())['method']=='account/rateLimits/read'
+        print(json.dumps({'id':3,'error':{'code':-32603,'message':'Not logged in'}}),flush=True)
+        request=json.loads(sys.stdin.readline())
+        assert request['method']=='account/read' and request['params']['refreshToken'] is True
+        print(json.dumps({'id':4,'result':{'account':None}}),flush=True)
         sys.stdin.read()
         """)
         check(QuotaSampler().sample(executableURL: absent, timeout: 3).issue == .authentication, "Missing account prompts login")
@@ -130,6 +152,26 @@ import Darwin
         let loggedIn = QuotaSampler().sample(executableURL: login, timeout: 3, onLoginURL: { _ in loginURLReceived.signal() })
         check(loggedIn == parsed && loginURLReceived.wait(timeout: .now()) == .success,
               "Browser login callback matches its login ID and refreshes quota")
+
+        if CommandLine.arguments.contains("--codex-discovery") || CommandLine.arguments.contains("--codex-live") {
+            let executable = CodexOptions().executableURL
+            check(executable != nil, "Discover the installed Codex CLI")
+            if let executable {
+                let detectedBundledCLI = executable.path.hasSuffix("/codex-cli/CodexCLI.app/Contents/MacOS/codex")
+                check(detectedBundledCLI, "Resolve ChatGPT's relocated bundled CLI")
+            }
+        }
+
+        if CommandLine.arguments.contains("--codex-live") {
+            let executable = CodexOptions().executableURL
+            if let executable {
+                let quota = QuotaSampler().sample(executableURL: executable)
+                FileHandle.standardError.write(Data("Codex CLI live query: \(quota.issue?.rawValue ?? "ok") \(quota.detail ?? "")\n".utf8))
+                check(quota.issue == nil && quota.fiveHour != nil && quota.weekly != nil,
+                      "Read the signed-in Codex five-hour and weekly quota")
+                print("Codex CLI detected and quota query completed.")
+            }
+        }
 
         if CommandLine.arguments.contains("--live") {
             let temperature = TemperatureSampler().sample()

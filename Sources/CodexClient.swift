@@ -1,6 +1,7 @@
 import Foundation
 import CFNetwork
 import Darwin
+import AppKit
 
 enum CodexIssue: String, Equatable {
     case missingCLI, startup, authentication, unsupportedAccount, network, rateLimited
@@ -30,7 +31,8 @@ enum CodexIssue: String, Equatable {
         case .startup: return "在终端运行 codex --version 检查 CLI 和配置；必要时更新 CLI 或重新选择文件。"
         case .authentication: return "点击“登录 Codex”，在浏览器中完成 ChatGPT 登录；也可在终端运行 codex login。"
         case .unsupportedAccount: return "需要提供订阅限额的 ChatGPT 账户。API Key、第三方 API 或某些账户没有 5h / 周限额。"
-        case .network, .timeout: return "检查网络；使用代理时打开系统代理并启用下方选项，然后立即刷新。程序也会自动重试。"
+        case .network: return "Codex CLI 的网络请求失败，程序会自动短重试。持续失败时检查代理程序和系统代理连接，然后立即刷新。"
+        case .timeout: return "Codex CLI 的限额请求超时，程序会自动短重试。持续失败时检查代理连接和 OpenAI 服务状态，然后立即刷新。"
         case .rateLimited: return "稍后自动重试；可把查询间隔调长。查询限流不等于订阅额度已用完。"
         case .service: return "服务端暂时出错，会自动重试；持续失败时查看 OpenAI 服务状态。"
         case .accessDenied: return "检查账户访问权限、网络和代理后重试；仍失败可重新登录或查看服务状态。"
@@ -94,13 +96,48 @@ struct CodexOptions: Sendable {
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser.path
         let custom = (customPath.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
-        let candidates = custom.isEmpty ? [
+        if !custom.isEmpty, fm.isExecutableFile(atPath: custom) {
+            return URL(fileURLWithPath: custom)
+        }
+        let candidates = [
             "\(home)/.local/bin/codex", "/opt/homebrew/bin/codex", "/usr/local/bin/codex", "\(home)/.cargo/bin/codex",
             "/Applications/Codex.app/Contents/Resources/codex", "/Applications/ChatGPT.app/Contents/Resources/codex",
-            "\(home)/Applications/Codex.app/Contents/Resources/codex"
-        ] + (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":").map { "\($0)/codex" } : [custom]
-        return candidates.first(where: { fm.isExecutableFile(atPath: $0) }).map { URL(fileURLWithPath: $0) }
+            "\(home)/Applications/Codex.app/Contents/Resources/codex",
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            "\(home)/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        ] + (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":").map { "\($0)/codex" }
+        if let match = candidates.first(where: { fm.isExecutableFile(atPath: $0) }) {
+            return URL(fileURLWithPath: match)
+        }
+        return Self.bundledCLIURL
     }
+
+    // Resolve unusual ChatGPT install locations once; normal redraws stay on the fast path above.
+    private static let bundledCLIURL: URL? = {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser.path
+        var appURLs = [URL]()
+        if let registered = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") {
+            appURLs.append(registered)
+        }
+        appURLs += [URL(fileURLWithPath: "/Applications/ChatGPT.app"),
+                    URL(fileURLWithPath: "\(home)/Applications/ChatGPT.app")]
+        var seen = Set<String>()
+        for appURL in appURLs where seen.insert(appURL.standardizedFileURL.path).inserted && fm.fileExists(atPath: appURL.path) {
+            let resources = appURL.appendingPathComponent("Contents/Resources", isDirectory: true)
+            let known = [resources.appendingPathComponent("codex").path,
+                         resources.appendingPathComponent("codex-cli/CodexCLI.app/Contents/MacOS/codex").path]
+            if let path = known.first(where: { fm.isExecutableFile(atPath: $0) }) { return URL(fileURLWithPath: path) }
+            let cliRoot = resources.appendingPathComponent("codex-cli", isDirectory: true)
+            guard let enumerator = fm.enumerator(at: cliRoot, includingPropertiesForKeys: [.isExecutableKey],
+                                                  options: [.skipsHiddenFiles]) else { continue }
+            for case let url as URL in enumerator where url.lastPathComponent == "codex" &&
+                url.path.contains("/Contents/MacOS/") && fm.isExecutableFile(atPath: url.path) {
+                return url
+            }
+        }
+        return nil
+    }()
 
     var environment: [String: String] {
         var env = ProcessInfo.processInfo.environment
@@ -141,7 +178,7 @@ final class QuotaSampler: @unchecked Sendable {
         return stopped
     }
 
-    func sample(executableURL: URL? = nil, timeout: TimeInterval = 20, options: CodexOptions = .init(),
+    func sample(executableURL: URL? = nil, timeout: TimeInterval = 45, options: CodexOptions = .init(),
                 onLoginURL: (@Sendable (URL) -> Void)? = nil) -> QuotaSnapshot {
         guard let executable = executableURL ?? options.executableURL else { return .init(issue: .missingCLI) }
         let process = Process()
@@ -184,9 +221,16 @@ final class QuotaSampler: @unchecked Sendable {
         var buffer = Data(), chunk = [UInt8](repeating: 0, count: 4096)
         var refreshedToken = false
         var loginID: String?
+        var quotaRetries = 0
+        var emptyQuotaRetried = false
+        var pendingQuotaRetry: (id: Int, at: TimeInterval)?
         do {
-            try send("initialize", id: 1, params: ["clientInfo": ["name": "glassmetrics", "title": "Glass Metrics", "version": "0.4.0"]])
+            try send("initialize", id: 1, params: ["clientInfo": ["name": "glassmetrics", "title": "Glass Metrics", "version": "0.4.1"]])
             while ProcessInfo.processInfo.systemUptime < deadline && !isStopped {
+                if let retry = pendingQuotaRetry, ProcessInfo.processInfo.systemUptime >= retry.at {
+                    pendingQuotaRetry = nil
+                    try send("account/rateLimits/read", id: retry.id)
+                }
                 let ready = poll(&descriptor, 1, 250)
                 if ready < 0 { if errno == EINTR { continue }; break }
                 if ready == 0 { continue }
@@ -201,6 +245,12 @@ final class QuotaSampler: @unchecked Sendable {
                     let id = object["id"] as? Int
                     if let error = object["error"] as? [String: Any], id != nil {
                         let failure = Self.serverFailure(error)
+                        if let id, [3, 5].contains(id),
+                           [.network, .timeout, .service, .unknown].contains(failure.issue), quotaRetries < 2 {
+                            quotaRetries += 1
+                            pendingQuotaRetry = (id, ProcessInfo.processInfo.systemUptime + Double(quotaRetries))
+                            continue
+                        }
                         if id == 3 && failure.issue == .authentication && !refreshedToken {
                             refreshedToken = true
                             try send("account/read", id: 4, params: ["refreshToken": true])
@@ -214,7 +264,7 @@ final class QuotaSampler: @unchecked Sendable {
                         guard result != nil else { return .init(issue: .invalidResponse) }
                         try send("initialized")
                         if onLoginURL != nil { try send("account/login/start", id: 10, params: ["type": "chatgpt"]) }
-                        else { try send("account/read", id: 2, params: ["refreshToken": false]) }
+                        else { try send("account/rateLimits/read", id: 3) }
                     case 2, 4:
                         guard let result else { return .init(issue: .invalidResponse) }
                         guard let account = result["account"] as? [String: Any] else { return .init(issue: .authentication) }
@@ -223,8 +273,14 @@ final class QuotaSampler: @unchecked Sendable {
                         }
                         try send("account/rateLimits/read", id: id == 4 ? 5 : 3)
                     case 3, 5:
-                        guard let result else { return .init(issue: .invalidResponse) }
-                        return Self.parse(result)
+                        guard let id, let result else { return .init(issue: .invalidResponse) }
+                        let snapshot = Self.parse(result)
+                        if snapshot.issue == .unsupportedAccount && !emptyQuotaRetried {
+                            emptyQuotaRetried = true
+                            pendingQuotaRetry = (id, ProcessInfo.processInfo.systemUptime + 0.3)
+                            continue
+                        }
+                        return snapshot
                     case 10:
                         guard let result, let value = result["authUrl"] as? String, let url = URL(string: value),
                               Self.isTrustedLoginURL(url), let identifier = result["loginId"] as? String else {
