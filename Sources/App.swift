@@ -3,6 +3,25 @@ import SwiftUI
 import Combine
 import ServiceManagement
 
+enum CardAppearance: String, CaseIterable, Identifiable {
+    case system, light, dark
+    var id: Self { self }
+    var title: String {
+        switch self {
+        case .system: return "跟随系统"
+        case .light: return "浅色"
+        case .dark: return "深色"
+        }
+    }
+    var nativeAppearance: NSAppearance? {
+        switch self {
+        case .system: return nil
+        case .light: return NSAppearance(named: .aqua)
+        case .dark: return NSAppearance(named: .darkAqua)
+        }
+    }
+}
+
 @MainActor final class MonitorState: ObservableObject {
     @Published var temperature: Double?
     @Published var download: Double?
@@ -37,8 +56,15 @@ import ServiceManagement
     @Published var glassOpacity: Double = UserDefaults.standard.object(forKey: "glassOpacity") as? Double ?? 0.55 {
         didSet { UserDefaults.standard.set(glassOpacity, forKey: "glassOpacity") }
     }
+    @Published var cardAppearance = CardAppearance(rawValue: UserDefaults.standard.string(forKey: "cardAppearance") ?? "") ?? .system {
+        didSet {
+            UserDefaults.standard.set(cardAppearance.rawValue, forKey: "cardAppearance")
+            onAppearanceChange?()
+        }
+    }
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     var onWindowModeChange: (() -> Void)?
+    var onAppearanceChange: (() -> Void)?
     private var networkTimer: Timer?
     private var temperatureTimer: Timer?
     private var quotaTimer: Timer?
@@ -344,6 +370,11 @@ struct SettingsView: View {
     var body: some View {
         TabView {
             Form {
+                Picker("卡片外观", selection: $state.cardAppearance) {
+                    ForEach(CardAppearance.allCases) { Text($0.title).tag($0) }
+                }
+                Text("深色使用白色文字，适合深色壁纸；跟随系统跟随 macOS 外观，不检测壁纸颜色。")
+                    .font(.caption).foregroundStyle(.secondary)
                 Picker("网速刷新", selection: $state.networkInterval) {
                     ForEach([1, 2, 5, 10], id: \.self) { Text("\($0) 秒").tag($0) }
                 }
@@ -463,6 +494,8 @@ final class CardHostingView: NSHostingView<MetricCard> {
         panel.setFrameAutosaveName("GlassMetricsCard")
         if !panel.setFrameUsingName("GlassMetricsCard") { panel.center() }
         state.onWindowModeChange = { [weak self] in self?.updateLevel() }
+        state.onAppearanceChange = { [weak self] in self?.updateAppearance() }
+        updateAppearance()
         updateLevel()
         panel.orderFrontRegardless()
 
@@ -490,6 +523,9 @@ final class CardHostingView: NSHostingView<MetricCard> {
         panel.collectionBehavior = state.floating
             ? [.canJoinAllSpaces, .fullScreenAuxiliary]
             : [.canJoinAllSpaces, .stationary, .ignoresCycle]
+    }
+    private func updateAppearance() {
+        panel.appearance = state.cardAppearance.nativeAppearance
     }
     func windowDidMove(_ notification: Notification) {
         if notification.object as? NSWindow === panel { panel.saveFrame(usingName: "GlassMetricsCard") }
