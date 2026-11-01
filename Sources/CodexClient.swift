@@ -225,7 +225,7 @@ final class QuotaSampler: @unchecked Sendable {
         var emptyQuotaRetried = false
         var pendingQuotaRetry: (id: Int, at: TimeInterval)?
         do {
-            try send("initialize", id: 1, params: ["clientInfo": ["name": "glassmetrics", "title": "Glass Metrics", "version": "0.4.2"]])
+            try send("initialize", id: 1, params: ["clientInfo": ["name": "glassmetrics", "title": "Glass Metrics", "version": "0.4.3"]])
             while ProcessInfo.processInfo.systemUptime < deadline && !isStopped {
                 if let retry = pendingQuotaRetry, ProcessInfo.processInfo.systemUptime >= retry.at {
                     pendingQuotaRetry = nil

@@ -63,6 +63,9 @@ enum CardAppearance: String, CaseIterable, Identifiable {
         }
     }
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var quotaTimeStyle = QuotaTimeStyle(rawValue: UserDefaults.standard.string(forKey: "quotaTimeStyle") ?? "") ?? .compact {
+        didSet { UserDefaults.standard.set(quotaTimeStyle.rawValue, forKey: "quotaTimeStyle") }
+    }
     var onWindowModeChange: (() -> Void)?
     var onAppearanceChange: (() -> Void)?
     private var networkTimer: Timer?
@@ -304,7 +307,7 @@ struct MetricCard: View {
             }
             quotaRow("5H", state.quota.fiveHour)
                 .opacity(state.quota.error == nil ? 1 : 0.5)
-            quotaRow("WEEK", state.quota.weekly)
+            quotaRow("WEEK", state.quota.weekly, weekly: true)
                 .opacity(state.quota.error == nil ? 1 : 0.5)
         }
         .padding(.horizontal, 22).padding(.vertical, 19)
@@ -330,7 +333,7 @@ struct MetricCard: View {
         }
     }
 
-    private func quotaRow(_ title: String, _ quota: QuotaWindow?) -> some View {
+    private func quotaRow(_ title: String, _ quota: QuotaWindow?, weekly: Bool = false) -> some View {
         HStack(spacing: 9) {
             Text(title).font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
                 .frame(width: 37, alignment: .leading)
@@ -344,8 +347,13 @@ struct MetricCard: View {
             Text(quota.map { String(format: "%.0f%%", $0.remaining) } ?? "—")
                 .font(.system(size: 11, weight: .semibold, design: .rounded)).monospacedDigit()
                 .frame(width: 35, alignment: .trailing)
-            Text(resetText(quota?.resetsAt)).font(.system(size: 9)).foregroundStyle(.secondary)
-                .frame(width: 58, alignment: .trailing)
+            TimelineView(.periodic(from: .now, by: 60)) { context in
+                Text(state.quotaTimeStyle.text(for: quota?.resetsAt, weekly: weekly, now: context.date))
+                    .font(.system(size: 9)).monospacedDigit().foregroundStyle(.secondary)
+                    .lineLimit(1).minimumScaleFactor(0.85)
+                    .help(quota?.resetsAt?.formatted(date: .abbreviated, time: .shortened) ?? "")
+            }
+            .frame(width: state.quotaTimeStyle.width, alignment: .trailing)
         }
     }
 
@@ -356,13 +364,6 @@ struct MetricCard: View {
         return String(format: "%.0f B/s", value)
     }
 
-    private func resetText(_ date: Date?) -> String {
-        guard let date else { return "" }
-        let seconds = max(0, Int(date.timeIntervalSinceNow))
-        if seconds >= 86_400 { return "\(seconds / 86_400)d later" }
-        if seconds >= 3_600 { return "\(seconds / 3_600)h later" }
-        return "\(max(1, seconds / 60))m later"
-    }
 }
 
 struct SettingsView: View {
@@ -400,6 +401,13 @@ struct SettingsView: View {
             .tabItem { Label("外观与刷新", systemImage: "slider.horizontal.3") }
 
             Form {
+                Section("卡片显示") {
+                    Picker("额度重置时间", selection: $state.quotaTimeStyle) {
+                        ForEach(QuotaTimeStyle.allCases) { Text($0.title).tag($0) }
+                    }
+                    Text("具体时间使用本地时区：5H 显示时分，WEEK 显示英文月简称、日和时分。精确倒计时：5H 到分钟，WEEK 到小时。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Section("账户与限额") {
                     Text(state.loginStatus ?? (state.quotaRunning ? "正在查询…" : state.quota.error ?? (state.lastQuotaUpdate == nil ? "尚未查询" : "连接正常")))
                         .font(.headline)

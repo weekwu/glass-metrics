@@ -9,6 +9,18 @@ import Darwin
     }
 
     static func main() throws {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        let shortReset = now.addingTimeInterval(4 * 3600 + 23 * 60 + 59)
+        let longReset = now.addingTimeInterval(6 * 86400 + 3 * 3600 + 3599)
+        check(QuotaTimeStyle.compact.text(for: shortReset, weekly: false, now: now) == "4h later", "Keep compact reset time")
+        check(QuotaTimeStyle.precise.text(for: shortReset, weekly: false, now: now) == "4h 23m later", "Five-hour countdown includes minutes")
+        check(QuotaTimeStyle.precise.text(for: longReset, weekly: true, now: now) == "6d 3h later", "Weekly countdown includes hours")
+        check(QuotaTimeStyle.precise.text(for: now.addingTimeInterval(30), weekly: false, now: now) == "<1m later", "Sub-minute reset is not shown as zero")
+        check(QuotaTimeStyle.compact.text(for: now, weekly: true, now: now) == "now", "Expired reset is not shown in the future")
+        check(QuotaTimeStyle.absolute.text(for: nil, weekly: true).isEmpty, "Missing reset stays empty")
+        let localDate = Calendar(identifier: .gregorian).date(from: DateComponents(year: 2026, month: 11, day: 7, hour: 18, minute: 30))!
+        check(QuotaTimeStyle.absolute.text(for: localDate, weekly: false) == "18:30", "Five-hour reset uses local 24-hour time")
+        check(QuotaTimeStyle.absolute.text(for: localDate, weekly: true) == "Nov 7 18:30", "Weekly reset uses abbreviated English month, day and local time")
         let five: [String: Any] = ["usedPercent": 25.0, "windowDurationMins": 300, "resetsAt": 2_000_000_000.0]
         let week: [String: Any] = ["usedPercent": 120.0, "windowDurationMins": 10080]
         let result: [String: Any] = ["rateLimitsByLimitId": ["codex": ["primary": five, "secondary": week]],

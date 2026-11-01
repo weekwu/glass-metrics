@@ -1,7 +1,7 @@
 #!/bin/zsh
 set -euo pipefail
 ROOT="${0:A:h}"
-OUT="$ROOT/GlassMetrics.app"
+OUT="$ROOT/.build/GlassMetrics.app"
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/glassmetrics-build.XXXXXX")"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 export CLANG_MODULE_CACHE_PATH="$BUILD_DIR/ModuleCache"
@@ -22,6 +22,7 @@ xcrun swiftc -O -parse-as-library -target arm64-apple-macos15.0 \
   -o "$STAGED_APP/Contents/MacOS/GlassMetrics"
 codesign --force --sign - "$STAGED_APP"
 codesign --verify --deep --strict "$STAGED_APP"
+mkdir -p "$ROOT/.build"
 rm -rf "$OUT"
 ditto "$STAGED_APP" "$OUT"
 echo "$OUT"
