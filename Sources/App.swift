@@ -22,6 +22,13 @@ enum CardAppearance: String, CaseIterable, Identifiable {
     }
 }
 
+enum CardMode: String, CaseIterable, Identifiable {
+    case full, systemOnly
+    var id: Self { self }
+    var title: String { self == .full ? "完整版" : "仅温度与网速" }
+    var height: CGFloat { self == .full ? 214 : 130 }
+}
+
 @MainActor final class MonitorState: ObservableObject {
     @Published var temperature: Double?
     @Published var download: Double?
@@ -62,12 +69,25 @@ enum CardAppearance: String, CaseIterable, Identifiable {
             onAppearanceChange?()
         }
     }
+    @Published var cardMode = CardMode(rawValue: UserDefaults.standard.string(forKey: "cardMode") ?? "") ?? .full {
+        didSet {
+            guard cardMode != oldValue else { return }
+            UserDefaults.standard.set(cardMode.rawValue, forKey: "cardMode")
+            if showsCodex {
+                refreshQuota()
+            } else {
+                suspendCodex()
+            }
+            onCardModeChange?()
+        }
+    }
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var quotaTimeStyle = QuotaTimeStyle(rawValue: UserDefaults.standard.string(forKey: "quotaTimeStyle") ?? "") ?? .compact {
         didSet { UserDefaults.standard.set(quotaTimeStyle.rawValue, forKey: "quotaTimeStyle") }
     }
     var onWindowModeChange: (() -> Void)?
     var onAppearanceChange: (() -> Void)?
+    var onCardModeChange: (() -> Void)?
     private var networkTimer: Timer?
     private var temperatureTimer: Timer?
     private var quotaTimer: Timer?
@@ -81,6 +101,7 @@ enum CardAppearance: String, CaseIterable, Identifiable {
     private var consecutiveFailures = 0
 
     var codexOptions: CodexOptions { .init(customPath: codexPath, useSystemProxy: useSystemProxy) }
+    var showsCodex: Bool { cardMode == .full }
 
     func start() {
         startNetwork()
@@ -93,26 +114,28 @@ enum CardAppearance: String, CaseIterable, Identifiable {
     func stop() {
         networkTimer?.invalidate()
         temperatureTimer?.invalidate()
-        quotaTimer?.invalidate()
-        quotaRequestID += 1
-        quotaReader?.stop()
-        quotaReader = nil
-        loginReader?.stop()
+        suspendCodex()
     }
 
     func prepareForSleep() {
+        let wasLoggingIn = loginInProgress
+        suspendCodex()
+        if wasLoggingIn { loginStatus = "睡眠中断了登录，请唤醒后重新登录。" }
+    }
+
+    private func suspendCodex() {
         quotaTimer?.invalidate()
+        quotaTimer = nil
+        nextQuotaAttempt = nil
         quotaRequestID += 1
         quotaReader?.stop()
         quotaReader = nil
         quotaRunning = false
-        if loginInProgress {
-            loginRequestID += 1
-            loginReader?.stop()
-            loginReader = nil
-            loginInProgress = false
-            loginStatus = "睡眠中断了登录，请唤醒后重新登录。"
-        }
+        loginRequestID += 1
+        loginReader?.stop()
+        loginReader = nil
+        loginInProgress = false
+        loginStatus = nil
     }
 
     func resumeAfterSleep() {
@@ -136,6 +159,7 @@ enum CardAppearance: String, CaseIterable, Identifiable {
     }
 
     private func scheduleQuota(after delay: TimeInterval) {
+        guard showsCodex else { return }
         quotaTimer?.invalidate()
         nextQuotaAttempt = Date().addingTimeInterval(delay)
         quotaTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
@@ -172,7 +196,7 @@ enum CardAppearance: String, CaseIterable, Identifiable {
     }
 
     private func readQuota() {
-        guard !quotaRunning, !loginInProgress else { return }
+        guard showsCodex, !quotaRunning, !loginInProgress else { return }
         quotaTimer?.invalidate()
         nextQuotaAttempt = nil
         quotaRunning = true
@@ -208,14 +232,14 @@ enum CardAppearance: String, CaseIterable, Identifiable {
     }
 
     func refreshQuota() {
-        guard !quotaRunning, !loginInProgress else { return }
+        guard showsCodex, !quotaRunning, !loginInProgress else { return }
         consecutiveFailures = 0
         loginStatus = nil
         readQuota()
     }
 
     func loginCodex() {
-        guard !loginInProgress, !quotaRunning else { return }
+        guard showsCodex, !loginInProgress, !quotaRunning else { return }
         loginRequestID += 1
         let requestID = loginRequestID
         quotaTimer?.invalidate(); nextQuotaAttempt = nil
@@ -295,23 +319,25 @@ struct MetricCard: View {
                 }
                 .padding(.top, 22)
             }
-            Rectangle().fill(.primary.opacity(0.12)).frame(height: 1)
-            HStack {
-                Text("CODEX").font(.system(size: 10, weight: .semibold)).tracking(1.7)
-                Spacer()
-                if let error = state.quota.error {
-                    Text(state.lastQuotaUpdate == nil ? error : "旧数据 · \(error)")
-                        .font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)
-                        .help(state.quota.issue?.recovery ?? error)
+            if state.showsCodex {
+                Rectangle().fill(.primary.opacity(0.12)).frame(height: 1)
+                HStack {
+                    Text("CODEX").font(.system(size: 10, weight: .semibold)).tracking(1.7)
+                    Spacer()
+                    if let error = state.quota.error {
+                        Text(state.lastQuotaUpdate == nil ? error : "旧数据 · \(error)")
+                            .font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)
+                            .help(state.quota.issue?.recovery ?? error)
+                    }
                 }
+                quotaRow("5H", state.quota.fiveHour)
+                    .opacity(state.quota.error == nil ? 1 : 0.5)
+                quotaRow("WEEK", state.quota.weekly, weekly: true)
+                    .opacity(state.quota.error == nil ? 1 : 0.5)
             }
-            quotaRow("5H", state.quota.fiveHour)
-                .opacity(state.quota.error == nil ? 1 : 0.5)
-            quotaRow("WEEK", state.quota.weekly, weekly: true)
-                .opacity(state.quota.error == nil ? 1 : 0.5)
         }
         .padding(.horizontal, 22).padding(.vertical, 19)
-        .frame(width: 360, height: 214)
+        .frame(width: 360, height: state.cardMode.height)
         .background {
             if #available(macOS 26, *) {
                 RoundedRectangle(cornerRadius: 27).fill(.clear)
@@ -371,6 +397,11 @@ struct SettingsView: View {
     var body: some View {
         TabView {
             Form {
+                Picker("卡片模式", selection: $state.cardMode) {
+                    ForEach(CardMode.allCases) { Text($0.title).tag($0) }
+                }
+                Text("仅温度与网速模式会暂停 Codex 额度查询。")
+                    .font(.caption).foregroundStyle(.secondary)
                 Picker("卡片外观", selection: $state.cardAppearance) {
                     ForEach(CardAppearance.allCases) { Text($0.title).tag($0) }
                 }
@@ -382,9 +413,11 @@ struct SettingsView: View {
                 Picker("温度刷新", selection: $state.temperatureInterval) {
                     ForEach([1, 2, 5, 10, 30, 60], id: \.self) { Text("\($0) 秒").tag($0) }
                 }
-                Picker("Codex 刷新", selection: $state.codexInterval) {
-                    Text("30 秒").tag(30)
-                    ForEach([1, 2, 5, 10], id: \.self) { Text("\($0) 分钟").tag($0 * 60) }
+                if state.showsCodex {
+                    Picker("Codex 刷新", selection: $state.codexInterval) {
+                        Text("30 秒").tag(30)
+                        ForEach([1, 2, 5, 10], id: \.self) { Text("\($0) 分钟").tag($0 * 60) }
+                    }
                 }
                 Toggle("始终置顶", isOn: $state.floating)
                 HStack {
@@ -400,58 +433,63 @@ struct SettingsView: View {
             .formStyle(.grouped)
             .tabItem { Label("外观与刷新", systemImage: "slider.horizontal.3") }
 
-            Form {
-                Section("卡片显示") {
-                    Picker("额度重置时间", selection: $state.quotaTimeStyle) {
-                        ForEach(QuotaTimeStyle.allCases) { Text($0.title).tag($0) }
-                    }
-                    Text("具体时间使用本地时区：5H 显示时分，WEEK 显示英文月简称、日和时分。精确倒计时：5H 到分钟，WEEK 到小时。")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Section("账户与限额") {
-                    Text(state.loginStatus ?? (state.quotaRunning ? "正在查询…" : state.quota.error ?? (state.lastQuotaUpdate == nil ? "尚未查询" : "连接正常")))
-                        .font(.headline)
-                    if let issue = state.quota.issue {
-                        Text(issue.recovery).font(.caption).foregroundStyle(.secondary)
-                        if let detail = state.quota.detail { Text(detail).font(.caption2).foregroundStyle(.secondary) }
-                    }
-                    if let date = state.lastQuotaUpdate {
-                        LabeledContent("上次成功", value: date.formatted(date: .omitted, time: .standard))
-                    }
-                    if let date = state.nextQuotaAttempt {
-                        LabeledContent("下次尝试", value: date.formatted(date: .omitted, time: .standard))
-                    }
-                    HStack {
-                        Button("立即刷新") { state.refreshQuota() }
-                            .disabled(state.quotaRunning || state.loginInProgress)
-                        Button("登录 Codex") { state.loginCodex() }
-                            .disabled(state.quotaRunning || state.loginInProgress)
-                        if state.loginInProgress { Button("取消登录") { state.cancelLogin() } }
-                    }
-                    Text("使用官方 ChatGPT 浏览器登录，复用本机 Codex CLI 账户；更换登录会影响使用同一账户配置的 Codex。")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Section("连接") {
-                    Toggle("使用系统 HTTP 代理", isOn: $state.useSystemProxy)
-                    Text(state.codexOptions.executableURL?.path ?? "未找到 codex，请安装官方 CLI 或手动选择。")
-                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-                    HStack {
-                        Button("选择 Codex…") { state.chooseCodex() }
-                            .disabled(state.quotaRunning || state.loginInProgress)
-                        if !state.codexPath.isEmpty {
-                            Button("自动查找") { state.codexPath = ""; state.refreshQuota() }
-                                .disabled(state.quotaRunning || state.loginInProgress)
-                        }
-                        Link("CLI 安装说明", destination: URL(string: "https://developers.openai.com/codex/cli/")!)
-                    }
-                    Text("代理选项读取系统手动 HTTP/HTTPS 代理；不支持仅 PAC。显式代理环境变量优先。")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+            if state.showsCodex {
+                codexForm.tabItem { Label("Codex", systemImage: "person.crop.circle") }
             }
-            .formStyle(.grouped)
-            .tabItem { Label("Codex", systemImage: "person.crop.circle") }
         }
         .frame(width: 470, height: 510)
+    }
+
+    private var codexForm: some View {
+        Form {
+            Section("卡片显示") {
+                Picker("额度重置时间", selection: $state.quotaTimeStyle) {
+                    ForEach(QuotaTimeStyle.allCases) { Text($0.title).tag($0) }
+                }
+                Text("具体时间使用本地时区：5H 显示时分，WEEK 显示英文月简称、日和时分。精确倒计时：5H 到分钟，WEEK 到小时。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("账户与限额") {
+                Text(state.loginStatus ?? (state.quotaRunning ? "正在查询…" : state.quota.error ?? (state.lastQuotaUpdate == nil ? "尚未查询" : "连接正常")))
+                    .font(.headline)
+                if let issue = state.quota.issue {
+                    Text(issue.recovery).font(.caption).foregroundStyle(.secondary)
+                    if let detail = state.quota.detail { Text(detail).font(.caption2).foregroundStyle(.secondary) }
+                }
+                if let date = state.lastQuotaUpdate {
+                    LabeledContent("上次成功", value: date.formatted(date: .omitted, time: .standard))
+                }
+                if let date = state.nextQuotaAttempt {
+                    LabeledContent("下次尝试", value: date.formatted(date: .omitted, time: .standard))
+                }
+                HStack {
+                    Button("立即刷新") { state.refreshQuota() }
+                        .disabled(state.quotaRunning || state.loginInProgress)
+                    Button("登录 Codex") { state.loginCodex() }
+                        .disabled(state.quotaRunning || state.loginInProgress)
+                    if state.loginInProgress { Button("取消登录") { state.cancelLogin() } }
+                }
+                Text("使用官方 ChatGPT 浏览器登录，复用本机 Codex CLI 账户；更换登录会影响使用同一账户配置的 Codex。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("连接") {
+                Toggle("使用系统 HTTP 代理", isOn: $state.useSystemProxy)
+                Text(state.codexOptions.executableURL?.path ?? "未找到 codex，请安装官方 CLI 或手动选择。")
+                    .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                HStack {
+                    Button("选择 Codex…") { state.chooseCodex() }
+                        .disabled(state.quotaRunning || state.loginInProgress)
+                    if !state.codexPath.isEmpty {
+                        Button("自动查找") { state.codexPath = ""; state.refreshQuota() }
+                            .disabled(state.quotaRunning || state.loginInProgress)
+                    }
+                    Link("CLI 安装说明", destination: URL(string: "https://developers.openai.com/codex/cli/")!)
+                }
+                Text("代理选项读取系统手动 HTTP/HTTPS 代理；不支持仅 PAC。显式代理环境变量优先。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 
@@ -475,6 +513,7 @@ final class CardHostingView: NSHostingView<MetricCard> {
     private let state = MonitorState()
     private var panel: NSPanel!
     private var settings: NSWindow?
+    private var refreshCodexItem: NSMenuItem?
     private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
 
@@ -484,7 +523,7 @@ final class CardHostingView: NSHostingView<MetricCard> {
             state.floating = false
             UserDefaults.standard.set(true, forKey: "interactionV2")
         }
-        let rect = NSRect(x: 0, y: 0, width: 360, height: 214)
+        let rect = NSRect(x: 0, y: 0, width: 360, height: state.cardMode.height)
         panel = NSPanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -503,17 +542,21 @@ final class CardHostingView: NSHostingView<MetricCard> {
         if !panel.setFrameUsingName("GlassMetricsCard") { panel.center() }
         state.onWindowModeChange = { [weak self] in self?.updateLevel() }
         state.onAppearanceChange = { [weak self] in self?.updateAppearance() }
+        state.onCardModeChange = { [weak self] in self?.updateCardMode() }
         updateAppearance()
         updateLevel()
-        panel.orderFrontRegardless()
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "设置…", action: #selector(showSettings), keyEquivalent: ","))
-        menu.addItem(NSMenuItem(title: "立即刷新 Codex", action: #selector(refreshCodex), keyEquivalent: ""))
+        let refreshItem = NSMenuItem(title: "立即刷新 Codex", action: #selector(refreshCodex), keyEquivalent: "")
+        menu.addItem(refreshItem)
+        refreshCodexItem = refreshItem
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q"))
         menu.items.forEach { $0.target = self }
         host.cardMenu = menu
+        updateCardMode()
+        panel.orderFrontRegardless()
         let workspaceNotifications = NSWorkspace.shared.notificationCenter
         sleepObserver = workspaceNotifications.addObserver(forName: NSWorkspace.willSleepNotification,
                                                            object: nil, queue: .main) { [weak self] _ in
@@ -534,6 +577,18 @@ final class CardHostingView: NSHostingView<MetricCard> {
     }
     private func updateAppearance() {
         panel.appearance = state.cardAppearance.nativeAppearance
+    }
+    private func updateCardMode() {
+        refreshCodexItem?.isHidden = !state.showsCodex
+        var frame = panel.frame
+        let height = state.cardMode.height
+        guard frame.height != height else { return }
+        frame.origin.y = frame.maxY - height
+        frame.size.height = height
+        if let visible = panel.screen?.visibleFrame {
+            frame.origin.y = max(visible.minY, min(frame.origin.y, visible.maxY - height))
+        }
+        panel.setFrame(frame, display: true)
     }
     func windowDidMove(_ notification: Notification) {
         if notification.object as? NSWindow === panel { panel.saveFrame(usingName: "GlassMetricsCard") }
